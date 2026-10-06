@@ -1,3 +1,4 @@
+import logging
 from typing import ClassVar
 
 import torch
@@ -9,7 +10,9 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
 )
 
+from speculators.losses import LossConfig, resolve_loss_config
 from speculators.model import DraftVocabMixin, SpeculatorModel
+from speculators.models.attention import create_float_mask
 from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.attention import create_anchor_block_mask_mod
 from speculators.models.dflash.metrics import compute_metrics
@@ -18,19 +21,32 @@ from speculators.models.dflash.utils import (
     get_base_indices_for_anchored_blocks,
     select_anchors,
 )
-from speculators.models.metrics import kl_div_loss, resolve_loss_fn
-from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
+from speculators.models.utils import (
+    conditional_torch_compile,
+    flatten_rope_parameters,
+    resolve_target_layer_ids,
+    resolve_verifier_norm_class,
+)
+
+logger = logging.getLogger(__name__)
+
+# Compile so the mask builds block-sparse instead of materializing DFlash's huge
+# dense [Q, KV] grid every step. (No benefit for EAGLE3's small autoregressive mask.)
+_compiled_create_block_mask = torch.compile(create_block_mask)
 
 
 @SpeculatorModel.register("dflash")
 class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     config_class: ClassVar[type[DFlashSpeculatorConfig]] = DFlashSpeculatorConfig  # type: ignore[misc]
+    supports_gradient_checkpointing = True  # noqa: D003  # Qwen3DFlashDecoderLayer inherits GradientCheckpointingLayer
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
     _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
         "embed_tokens.weight",
         "verifier_norm.weight",
         # verifier_lm_head is reloaded from the verifier (see load_verifier_weights)
         # and excluded on save, so it is expected to be absent from checkpoints.
+        # lm_head is handled per-instance in __init__: omitted only for full-vocab
+        # drafts, where it is the exact frozen verifier projection.
         "verifier_lm_head.weight",
         "t2d",
         "d2t",
@@ -43,6 +59,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     t2d: torch.Tensor | None
     d2t: torch.Tensor | None
 
+    def _make_decoder_layer(
+        self, config: DFlashSpeculatorConfig, layer_idx: int
+    ) -> nn.Module:
+        """Build one draft decoder layer.
+
+        DFlash-family variants override this factory when they wrap the shared
+        attention and MLP with additional modules.
+        """
+        return Qwen3DFlashDecoderLayer(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
+
     def __init__(
         self,
         config: DFlashSpeculatorConfig,
@@ -54,8 +80,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             )
         self._attn_impl = config.transformer_layer_config._attn_implementation  # noqa: SLF001
         self._create_mask_fn = (
-            create_block_mask
+            _compiled_create_block_mask
             if self._attn_impl == "simple_flex_attention"
+            else create_float_mask
+            if self._attn_impl == "eager"
             else create_mask
         )
         super().__init__(config=config)
@@ -67,14 +95,17 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         num_draft_layers = tl_config.num_hidden_layers
         self.layers = nn.ModuleList(
             [
-                Qwen3DFlashDecoderLayer(config.transformer_layer_config, layer_idx)  # type: ignore[arg-type]
+                self._make_decoder_layer(config, layer_idx)
                 for layer_idx in range(num_draft_layers)
             ]
         )
-        self.sliding_window = tl_config.sliding_window
+        # Both are optional: declared only for alternating/sliding attention.
+        self.sliding_window = getattr(tl_config, "sliding_window", None)
         self.sliding_window_indices = [
             i
-            for i, layer_type in enumerate(tl_config.layer_types)
+            for i, layer_type in enumerate(
+                getattr(tl_config, "layer_types", None) or []
+            )
             if layer_type == "sliding_attention"
         ]
         self.uses_sliding_window_attn = bool(self.sliding_window_indices)
@@ -85,7 +116,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
-        self.rotary_emb = Qwen3RotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
+        rotary_config = flatten_rope_parameters(config.transformer_layer_config)
+        self.rotary_emb = Qwen3RotaryEmbedding(rotary_config)  # type: ignore[arg-type]
 
         self.fc = nn.Linear(
             len(self.target_layer_ids) * config.transformer_layer_config.hidden_size,
@@ -96,18 +128,52 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
-        self.verifier_norm = Qwen3RMSNorm(
+        self.verifier_norm = resolve_verifier_norm_class(config)(
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
         )
         self.verifier_norm.weight.requires_grad = False
         self.block_size = config.block_size
+
+        # Warn if using DFlash with sample_from_anchor=True (may not be supported)
+        if type(self).__name__ == "DFlashDraftModel" and config.sample_from_anchor:
+            logger.warning(
+                "DFlash with sample_from_anchor=True may not be supported in "
+                "all inference engines (e.g., vLLM). Verify compatibility with your "
+                "deployment target."
+            )
+
         self.post_init()
+        # Verifier-owned weights are reconstructed on load. Keep a reduced-vocab
+        # lm_head serialized because current runtimes cannot derive it from the
+        # full verifier head.
+        #
+        # Shadow the ClassVar lists with per-instance copies so full- and
+        # reduced-vocabulary siblings cannot mutate each other's save rules.
+        keys_to_ignore_on_save = list(type(self)._keys_to_ignore_on_save)  # noqa: SLF001
+        keys_to_ignore_on_load_missing = list(
+            type(self)._keys_to_ignore_on_load_missing  # noqa: SLF001
+        )
+        keys_to_ignore_on_save.append("embed_tokens.weight")
+        if not self.use_draft_vocab:
+            keys_to_ignore_on_save.append("lm_head.weight")
+            keys_to_ignore_on_load_missing.append("lm_head.weight")
+        self.__dict__["_keys_to_ignore_on_save"] = keys_to_ignore_on_save
+        self.__dict__["_keys_to_ignore_on_load_missing"] = (
+            keys_to_ignore_on_load_missing
+        )
 
     @property
     def target_layer_ids(self) -> list[int]:
         """Target layer IDs for auxiliary hidden states."""
         return self.config.aux_hidden_state_layer_ids
+
+    def load_verifier_weights(self):
+        """Reconstruct weights intentionally omitted from DFlash checkpoints."""
+        self._load_verifier_weights(
+            overwrite_embed_tokens=True,
+            overwrite_lm_head=not self.use_draft_vocab,
+        )
 
     @classmethod
     def from_training_args(
@@ -128,7 +194,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             **kwargs: Training arguments with DFlash-specific params
                 - draft_vocab_size: Size of draft vocabulary
                 - block_size: Block size for draft predictions (default: 8)
-                - max_anchors: Max anchor positions during training (default: 256)
                 - verifier_name_or_path: Path to verifier model
 
         Returns:
@@ -138,6 +203,25 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             The number of draft layers is encoded in verifier_config.num_hidden_layers,
             following the same pattern as EAGLE3.
         """
+        config = DFlashSpeculatorConfig(
+            **cls._build_base_config_kwargs("dflash", verifier_config, **kwargs)
+        )
+
+        model = cls(config=config)
+        model.load_vocab_mappings(t2d, d2t)
+        model.load_verifier_weights()
+        return model
+
+    @staticmethod
+    def _build_base_config_kwargs(
+        algorithm: str,
+        verifier_config: "PretrainedConfig",
+        **kwargs,
+    ) -> dict:
+        """Shared DFlash-family config kwargs for ``from_training_args``.
+
+        DSpark reuses this and appends its Markov/confidence/loss fields.
+        """
         from speculators.config import (  # noqa: PLC0415
             SpeculatorsConfig,
             VerifierConfig,
@@ -146,42 +230,53 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             GreedyTokenProposalConfig,
         )
 
-        # Resolve target layer IDs if not provided
         target_layer_ids = resolve_target_layer_ids(
-            kwargs.get("target_layer_ids"), kwargs["verifier_name_or_path"]
+            kwargs.get("target_layer_ids"),
+            kwargs["verifier_name_or_path"],
+            trust_remote_code=kwargs.get("trust_remote_code", False),
         )
-
         verifier_config._attn_implementation = kwargs.get(  # noqa: SLF001
             "draft_attn_impl", "simple_flex_attention"
         )
+        block_size = kwargs.get("block_size", 8)
 
-        config = DFlashSpeculatorConfig(
-            transformer_layer_config=verifier_config,
-            draft_vocab_size=kwargs["draft_vocab_size"],
-            block_size=kwargs.get("block_size", 8),
-            max_anchors=kwargs.get("max_anchors", 3072),
-            aux_hidden_state_layer_ids=target_layer_ids,
-            mask_token_id=kwargs.get("mask_token_id"),
-            sliding_window_non_causal=kwargs.get("sliding_window_non_causal", False),
-            speculators_config=SpeculatorsConfig(
-                algorithm="dflash",
+        default_sample_from_anchor = algorithm == "dspark"
+        sample_from_anchor_arg = kwargs.get("sample_from_anchor")
+        sample_from_anchor = (
+            default_sample_from_anchor
+            if sample_from_anchor_arg is None
+            else sample_from_anchor_arg
+        )
+        default_non_causal = algorithm == "dflash2"
+        non_causal_arg = kwargs.get("sliding_window_non_causal")
+        sliding_window_non_causal = (
+            default_non_causal if non_causal_arg is None else non_causal_arg
+        )
+
+        # Calculate speculative tokens based on sample_from_anchor
+        # False: anchor is bonus token (block_size - 1 tokens)
+        # True: sample from anchor too (block_size tokens)
+        speculative_tokens = block_size if sample_from_anchor else block_size - 1
+
+        return {
+            "transformer_layer_config": verifier_config,
+            "draft_vocab_size": kwargs["draft_vocab_size"],
+            "block_size": block_size,
+            "aux_hidden_state_layer_ids": target_layer_ids,
+            "mask_token_id": kwargs.get("mask_token_id"),
+            "sliding_window_non_causal": sliding_window_non_causal,
+            "sample_from_anchor": sample_from_anchor,
+            "speculators_config": SpeculatorsConfig(
+                algorithm=algorithm,
                 proposal_methods=[
-                    GreedyTokenProposalConfig(
-                        # DFlash first position is anchor position, not used during gen
-                        speculative_tokens=kwargs.get("block_size", 8) - 1,
-                    )
+                    GreedyTokenProposalConfig(speculative_tokens=speculative_tokens)
                 ],
                 default_proposal_method="greedy",
                 verifier=VerifierConfig.from_pretrained(
                     kwargs["verifier_name_or_path"]
                 ),
             ),
-        )
-
-        model = cls(config=config)
-        model.load_vocab_mappings(t2d, d2t)
-        model.load_verifier_weights()
-        return model
+        }
 
     @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
@@ -193,12 +288,23 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         Returns:
             Tuple of (train_call_kwargs, val_call_kwargs)
         """
-        loss_fn = resolve_loss_fn(kwargs["loss_fn"])
+        loss_config = resolve_loss_config(
+            kwargs["loss_fn"], kwargs.get("loss_implementation", "fused")
+        )
         gamma = kwargs.get("dflash_decay_gamma", 4.0)
-        return {"loss_fn": loss_fn, "gamma": gamma}, {
-            "loss_fn": loss_fn,
+        max_anchors = kwargs.get("max_anchors", 512)
+        per_position_loss_weight = kwargs.get(
+            "per_position_loss_weight", "fixed-exp-decay"
+        )
+        dpace_alpha = kwargs.get("dpace_alpha", 0.5)
+        shared = {
+            "loss_config": loss_config,
             "gamma": gamma,
+            "max_anchors": max_anchors,
+            "per_position_loss_weight": per_position_loss_weight,
+            "dpace_alpha": dpace_alpha,
         }
+        return dict(shared), dict(shared)
 
     @property
     def mask_token_id(self) -> int:
@@ -238,11 +344,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
 
     @torch.compiler.disable
-    def _build_attention_mask(self, loss_mask, document_ids, device):
+    def _build_attention_mask(self, loss_mask, max_anchors, document_ids, device):
         total_seq_len = loss_mask.shape[1]
 
         anchor_positions, anchor_valid = select_anchors(
-            loss_mask, self.config.max_anchors, self.block_size
+            loss_mask, max_anchors, self.block_size
         )
 
         full_attn_mask = None
@@ -268,30 +374,33 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
 
-    @conditional_torch_compile
-    def forward(
+    def _backbone_forward(
         self,
-        hidden_states: torch.Tensor,  # shape: [1,total_seq_len,num_hidden*hidden_size]
-        input_ids: torch.Tensor,  # shape: [1, total_seq_len]
-        loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
-        verifier_last_hidden_states: torch.Tensor,  # shape: [1, total_seq_len, hidden_size] # noqa: E501
-        document_ids: torch.Tensor,  # shape: [1, total_seq_len]
-        position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
-        loss_fn=kl_div_loss,
-        gamma: float = 4.0,
+        hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
+        input_ids: torch.Tensor,  # [1, total_seq_len]
+        loss_mask: torch.Tensor,  # [1, total_seq_len]
+        verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
+        document_ids: torch.Tensor,  # [1, total_seq_len]
+        position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
         **kwargs,
     ):
+        """Run the anchored-block draft transformer up to the draft logits.
+
+        Returns ``(hidden, logits, targets, aligned_loss_mask,
+        anchored_block_indices)``. DSpark reuses this and adds its Markov and
+        confidence heads before computing its own loss.
+        """
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
-        num_anchors = self.config.max_anchors
+        num_anchors = kwargs.pop("max_anchors", 512)
 
         if position_ids is None:
-            position_ids = 1 + torch.arange(
+            position_ids = torch.arange(
                 total_seq_len, dtype=torch.long, device=device
             ).unsqueeze(0)
 
         full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
-            self._build_attention_mask(loss_mask, document_ids, device)
+            self._build_attention_mask(loss_mask, num_anchors, document_ids, device)
         )
 
         mask_tokens_size = num_anchors * self.block_size
@@ -325,12 +434,22 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )  # shape: [num_anchors*block_size]
 
         with torch.no_grad():
-            verifier_logits = self.verifier_lm_head(
-                self.verifier_norm(verifier_last_hidden_states)
-            )
-            # Shift right by 1 so verifier_logits[i] predicts token at position i
-            verifier_logits = torch.roll(verifier_logits, 1, dims=1)
-            targets = verifier_logits[:, anchored_block_indices]
+            if anchored_block_indices.numel() < total_seq_len:
+                target_indices = (
+                    anchored_block_indices
+                    if self.config.sample_from_anchor
+                    else (anchored_block_indices - 1) % total_seq_len
+                )
+                targets = self.verifier_lm_head(
+                    self.verifier_norm(verifier_last_hidden_states[:, target_indices])
+                )
+            else:
+                verifier_logits = self.verifier_lm_head(
+                    self.verifier_norm(verifier_last_hidden_states)
+                )
+                if not self.config.sample_from_anchor:
+                    verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+                targets = verifier_logits[:, anchored_block_indices]
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
         for layer_idx, layer in enumerate(self.layers):
@@ -346,7 +465,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 **kwargs,
             )
 
-        logits = self.lm_head(self.norm(noise_embedding))
+        hidden = self.norm(noise_embedding)
+        logits = self.lm_head(hidden)
         # shape: [1, num_anchors*block_size, vocab_size]
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
@@ -359,15 +479,47 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             .to(aligned_loss_mask.dtype)
         )  # shape: [1, num_anchors*block_size]
 
-        aligned_loss_mask[:, :: self.block_size] = 0
+        # For sample_from_anchor=False, mask slot 0 (anchor) since it's not trained
+        if not self.config.sample_from_anchor:
+            aligned_loss_mask[:, :: self.block_size] = 0
+
+        return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
+
+    @conditional_torch_compile
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # shape: [1,total_seq_len,num_hidden*hidden_size]
+        input_ids: torch.Tensor,  # shape: [1, total_seq_len]
+        loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
+        verifier_last_hidden_states: torch.Tensor,  # shape: [1, total_seq_len, hidden_size] # noqa: E501
+        document_ids: torch.Tensor,  # shape: [1, total_seq_len]
+        position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
+        loss_config: LossConfig | None = None,
+        gamma: float = 4.0,
+        max_anchors: int = 512,
+        per_position_loss_weight: str = "fixed-exp-decay",
+        dpace_alpha: float = 0.5,
+        **kwargs,
+    ):
+        _, logits, targets, aligned_loss_mask, _ = self._backbone_forward(
+            hidden_states,
+            input_ids,
+            loss_mask,
+            verifier_last_hidden_states,
+            document_ids,
+            position_ids,
+            max_anchors=max_anchors,
+            **kwargs,
+        )
         loss, metrics = compute_metrics(
             logits,
             targets,
             aligned_loss_mask,
             self.block_size,
             gamma=gamma,
-            loss_fn=loss_fn,
+            loss_config=loss_config,
+            per_position_loss_weight=per_position_loss_weight,
+            dpace_alpha=dpace_alpha,
+            sample_from_anchor=self.config.sample_from_anchor,
         )
-        draft_tokens = torch.argmax(logits, dim=-1)
-
-        return draft_tokens, loss, metrics
+        return None, loss, metrics

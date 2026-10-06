@@ -18,7 +18,7 @@ from speculators.models.mtp.core import MTPDraftModel
 from speculators.models.peagle.config import PEagleSpeculatorConfig
 from speculators.models.peagle.core import PEagleDraftModel
 from speculators.proposals.greedy import GreedyTokenProposalConfig
-from speculators.train.data import create_collate_fn
+from speculators.train.data import CollateFn
 
 # ---------------------------------------------------------------------------
 # Tiny verifier configs
@@ -98,6 +98,7 @@ def make_eagle3_model(
     draft_vocab_size: int = 64,
     norm_before_residual: bool = False,
     norm_before_fc: bool = False,
+    fc_norm: bool = False,
     norm_output: bool = False,
     draft_attn_impl: str | None = None,
     device: str = "cuda:0",
@@ -111,6 +112,7 @@ def make_eagle3_model(
         draft_vocab_size=draft_vocab_size,
         norm_before_residual=norm_before_residual,
         norm_before_fc=norm_before_fc,
+        fc_norm=fc_norm,
         norm_output=norm_output,
         embed_requires_grad=False,
         speculators_config=SpeculatorsConfig(
@@ -132,7 +134,6 @@ def make_dflash_model(
     *,
     draft_vocab_size: int = 64,
     block_size: int = 4,
-    max_anchors: int = 8,
     draft_attn_impl: str | None = None,
     device: str = "cuda:0",
     dtype: torch.dtype = torch.bfloat16,
@@ -145,7 +146,6 @@ def make_dflash_model(
         transformer_layer_config=transformer_config,
         draft_vocab_size=draft_vocab_size,
         block_size=block_size,
-        max_anchors=max_anchors,
         aux_hidden_state_layer_ids=[0, 1, 2],
         mask_token_id=0,
         speculators_config=SpeculatorsConfig(
@@ -169,8 +169,8 @@ def make_peagle_model(
     *,
     draft_vocab_size: int = 64,
     num_depths: int = 4,
-    down_sample_ratio: float = 0.7,
     norm_before_fc: bool = False,
+    fc_norm: bool = False,
     norm_output: bool = False,
     draft_attn_impl: str | None = None,
     device: str = "cuda:0",
@@ -184,11 +184,9 @@ def make_peagle_model(
         draft_vocab_size=draft_vocab_size,
         norm_before_residual=False,
         norm_before_fc=norm_before_fc,
+        fc_norm=fc_norm,
         norm_output=norm_output,
         embed_requires_grad=True,
-        num_depths=num_depths,
-        down_sample_ratio=down_sample_ratio,
-        down_sample_ratio_min=0.2,
         mask_token_id=0,
         speculators_config=SpeculatorsConfig(
             algorithm="peagle",
@@ -210,6 +208,7 @@ def make_mtp_model(
     num_speculative_steps: int = 3,
     device: str = "cuda:0",
     dtype: torch.dtype = torch.bfloat16,
+    torch_compile: bool = True,
 ) -> MTPDraftModel:
     """Create a tiny MTP model mirroring Qwen3.5-0.8B architecture."""
     from transformers.models.qwen3_5.configuration_qwen3_5 import (  # noqa: PLC0415
@@ -234,7 +233,13 @@ def make_mtp_model(
     )
     model = MTPDraftModel(config)
     _fill_nan_weights(model)
-    return model.to(device=device, dtype=dtype)  # type: ignore[call-arg]
+    model = model.to(device=device, dtype=dtype)  # type: ignore[call-arg]
+    if not torch_compile:
+        import types  # noqa: PLC0415
+
+        orig = model.forward._torchdynamo_orig_callable
+        model.forward = types.MethodType(orig, model)
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +315,7 @@ def make_batch(
 ) -> dict[str, torch.Tensor]:
     """Collate a list of samples into a single batch using the real collate_fn.
 
-    Uses ``create_collate_fn`` from ``speculators.train.data`` to pack and pad
+    Uses ``CollateFn`` from ``speculators.train.data`` to pack and pad
     samples exactly the way the training pipeline does.
 
     Args:
@@ -325,14 +330,16 @@ def make_batch(
     Returns:
         Dict with keys matching model forward() signatures, all on ``device``.
     """
-    collate_fn = create_collate_fn(
+    collate_fn = CollateFn(
         max_len=max_len,
         hidden_size=hidden_size,
         num_target_layers=num_target_layers,
         preprocess=preprocess,
     )
     batch = collate_fn(samples)
-    return {k: v.to(device) for k, v in batch.items()}
+    return {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()
+    }
 
 
 # ---------------------------------------------------------------------------

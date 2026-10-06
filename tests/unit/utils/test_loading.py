@@ -8,6 +8,7 @@ from transformers import AutoModelForCausalLM
 
 from speculators.utils.loading import (
     _resolve_file,
+    _resolve_key,
     is_config_only_dir,
     load_model_layers,
 )
@@ -54,6 +55,165 @@ def test_is_config_only_dir_detects_sharded_index(tmp_path, index_file):
     (tmp_path / index_file).write_text("{}")
 
     assert is_config_only_dir(tmp_path) is False
+
+
+# _resolve_key Tests
+
+
+FAKE_WEIGHT_MAP = {
+    "model.embed_tokens.weight": "shard-0.safetensors",
+    "model.layers.0.self_attn.q_proj.weight": "shard-0.safetensors",
+    "tok_embeddings.weight": "shard-1.safetensors",
+    "output.weight": "shard-1.safetensors",
+    "norm.weight": "shard-1.safetensors",
+}
+
+
+@pytest.mark.smoke
+def test_resolve_key_exact_match():
+    assert _resolve_key("model.embed_tokens.weight", FAKE_WEIGHT_MAP) == (
+        "model.embed_tokens.weight"
+    )
+
+
+@pytest.mark.smoke
+def test_resolve_key_suffix_match():
+    assert _resolve_key("self_attn.q_proj.weight", FAKE_WEIGHT_MAP) == (
+        "model.layers.0.self_attn.q_proj.weight"
+    )
+
+
+@pytest.mark.smoke
+def test_resolve_key_alias_exact():
+    wm = {"tok_embeddings.weight": "shard.safetensors"}
+    assert _resolve_key("embed_tokens.weight", wm) == "tok_embeddings.weight"
+
+
+@pytest.mark.smoke
+def test_resolve_key_alias_suffix():
+    wm = {"model.tok_embeddings.weight": "shard.safetensors"}
+    assert _resolve_key("embed_tokens.weight", wm) == "model.tok_embeddings.weight"
+
+
+@pytest.mark.smoke
+def test_resolve_key_all_aliases():
+    wm_lm = {"output.weight": "s.safetensors"}
+    assert _resolve_key("lm_head.weight", wm_lm) == "output.weight"
+
+    wm_norm = {"norm.weight": "s.safetensors"}
+    assert _resolve_key("model.norm.weight", wm_norm) == "norm.weight"
+
+
+@pytest.mark.smoke
+def test_resolve_key_miss():
+    assert _resolve_key("nonexistent.weight", FAKE_WEIGHT_MAP) is None
+
+
+@pytest.mark.smoke
+def test_resolve_key_prefers_exact_over_alias():
+    wm = {
+        "embed_tokens.weight": "shard-0.safetensors",
+        "tok_embeddings.weight": "shard-1.safetensors",
+    }
+    assert _resolve_key("embed_tokens.weight", wm) == "embed_tokens.weight"
+
+
+@pytest.mark.smoke
+def test_resolve_key_prefers_shortest_suffix():
+    """When several keys share the searched suffix, the shortest (most specific)
+    one wins via ``min(matches, key=len)``.
+
+    None of the keys match an alias here, so resolution falls through to the
+    generic ``norm.weight`` suffix scan and the tie-break is exercised directly
+    rather than short-circuited by an alias hit (see ``test_resolve_key_llm_aliases``
+    for the alias path).
+    """
+    wm = {
+        "model.audio.final_norm.weight": "shard-a.safetensors",
+        "model.text.norm.weight": "shard-b.safetensors",
+    }
+    # Both keys end in "norm.weight" (reached via the model.norm.weight ->
+    # norm.weight alias); the shorter, more-specific key must win over the audio
+    # tower's norm.
+    assert _resolve_key("model.norm.weight", wm) == "model.text.norm.weight"
+
+
+@pytest.mark.smoke
+def test_resolve_key_mamba_backbone_embedding():
+    """NemotronH, Mamba/Mamba2/FalconMamba use ``backbone.embeddings.weight``."""
+    wm = {
+        "backbone.embeddings.weight": "shard-0.safetensors",
+        "lm_head.weight": "shard-1.safetensors",
+    }
+    assert _resolve_key("embed_tokens.weight", wm) == "backbone.embeddings.weight"
+
+
+@pytest.mark.smoke
+def test_resolve_key_standard_embed_unaffected_by_mamba_alias():
+    """Standard ``model.embed_tokens.weight`` still hits the primary candidate,
+    ahead of the new Mamba alias (llama/qwen/gemma, Bamba/Jamba/Zamba2 unchanged)."""
+    wm = {
+        "model.embed_tokens.weight": "shard-0.safetensors",
+        "backbone.embeddings.weight": "shard-1.safetensors",
+    }
+    assert _resolve_key("embed_tokens.weight", wm) == "model.embed_tokens.weight"
+
+
+@pytest.mark.smoke
+def test_resolve_key_backbone_alias_is_boundary_safe():
+    """Aliases are specific, so unrelated ``*_embeddings.weight`` tensors
+    (``position_embeddings.weight``, ``word_embeddings.weight``) don't resolve."""
+    wm = {
+        "position_embeddings.weight": "shard-0.safetensors",
+        "encoder.word_embeddings.weight": "shard-1.safetensors",
+    }
+    assert _resolve_key("embed_tokens.weight", wm) is None
+
+
+@pytest.mark.smoke
+def test_resolve_key_mamba_backbone_final_norm():
+    """Mamba-backbone final norm ``backbone.norm_f.weight`` resolves."""
+    wm = {
+        "backbone.embeddings.weight": "shard-0.safetensors",
+        "backbone.norm_f.weight": "shard-1.safetensors",
+        "lm_head.weight": "shard-1.safetensors",
+    }
+    assert _resolve_key("model.norm.weight", wm) == "backbone.norm_f.weight"
+
+
+@pytest.mark.smoke
+def test_resolve_key_final_norm_not_confused_with_per_layer_norm():
+    """Final norm must not resolve to a per-layer ``backbone.layers.N.norm.weight``
+    (which also ends in ``norm.weight``); the specific alias is tried first."""
+    wm = {
+        "backbone.layers.0.norm.weight": "shard-0.safetensors",
+        "backbone.layers.1.norm.weight": "shard-0.safetensors",
+        "backbone.norm_f.weight": "shard-1.safetensors",
+    }
+    assert _resolve_key("model.norm.weight", wm) == "backbone.norm_f.weight"
+
+
+@pytest.mark.smoke
+def test_resolve_key_standard_final_norm_unaffected_by_mamba_alias():
+    """Standard ``model.norm.weight`` still hits the primary candidate (unchanged)."""
+    wm = {
+        "model.norm.weight": "shard-0.safetensors",
+        "backbone.norm_f.weight": "shard-1.safetensors",
+    }
+    assert _resolve_key("model.norm.weight", wm) == "model.norm.weight"
+
+
+@pytest.mark.smoke
+def test_resolve_key_llm_aliases():
+    """Inkling-style keys with llm. prefix resolve correctly."""
+    wm = {
+        "model.llm.embed.weight": "shard-0.safetensors",
+        "model.llm.unembed.weight": "shard-1.safetensors",
+        "model.llm.norm.weight": "shard-2.safetensors",
+    }
+    assert _resolve_key("embed_tokens.weight", wm) == "model.llm.embed.weight"
+    assert _resolve_key("lm_head.weight", wm) == "model.llm.unembed.weight"
+    assert _resolve_key("model.norm.weight", wm) == "model.llm.norm.weight"
 
 
 # _resolve_file Tests

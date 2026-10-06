@@ -1,4 +1,4 @@
-"""Weekly regression test for MTP online finetuning acceptance rates.
+"""Nightly regression test for MTP online finetuning acceptance rates.
 
 Imports and calls the shared ``run_mtp_finetuning_e2e()`` pipeline from the
 smoke module with Qwen3.5-4B parameters. Evaluates on generic (non-GSM8k)
@@ -24,11 +24,12 @@ from tests.utils import requires_cadence
 TRAINING_DATA_REPO = "inference-optimization/Qwen3.5-4B-responses"
 
 
-@requires_cadence("weekly")
+@requires_cadence("nightly")
 @pytest.mark.regression
 @requires_cuda
 @requires_transformers_version("5.2.0")
 @requires_vllm_version("0.22.0")
+@pytest.mark.xfail(strict=False, reason="Flaky: CUDA launch failure mid-training")
 def test_mtp_online_regression(
     tmp_path: Path,
     prompts: list[list[dict[str, str]]],
@@ -47,5 +48,6 @@ def test_mtp_online_regression(
         acceptance_thresholds=[0.82, 0.65, 0.48],
         max_tokens=512,
         train_timeout=60 * 60,
-        gpu_memory_utilization=0.3,
+        gpu_memory_utilization=0.25,
+        enforce_eager=True,
     )

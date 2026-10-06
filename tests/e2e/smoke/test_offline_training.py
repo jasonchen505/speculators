@@ -1,7 +1,7 @@
 """E2E test for the offline training workflow.
 
 Exercises the full offline pipeline:
-  1. Prepare data (scripts/prepare_data.py)
+  1. Prepare data (pre-tokenized download or render-boundary tokenization)
   2. Launch a vLLM server for hidden-state extraction (scripts/launch_vllm.py)
   3. Generate hidden states offline (scripts/data_generation_offline.py)
   4. Stop the vLLM server
@@ -30,20 +30,43 @@ MM_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
 @pytest.mark.e2e
 @pytest.mark.slow
 @pytest.mark.parametrize(
-    ("model", "dataset", "speculator_type", "extra_train_args", "target_layer_ids"),
+    (
+        "model",
+        "dataset",
+        "speculator_type",
+        "extra_train_args",
+        "target_layer_ids",
+        "draft_vocab_size",
+    ),
     [
-        (TEXT_MODEL, "sharegpt", "eagle3", [], None),  # Use default EAGLE layers
-        (MM_MODEL, "sharegpt4v_coco", "eagle3", [], None),  # Multimodal
         (
             TEXT_MODEL,
-            "sharegpt",
+            "hf:inference-optimization/speculators-ci-datasets:smoke_regen",
+            "eagle3",
+            [],
+            None,
+            8192,
+        ),
+        (MM_MODEL, "sharegpt4v_coco", "eagle3", [], None, 8192),  # Multimodal
+        (
+            TEXT_MODEL,
+            "hf:inference-optimization/speculators-ci-datasets:smoke_regen",
             "dflash",
             ["--block-size", "8", "--max-anchors", "256", "--num-layers", "3"],
             [1, 13, 25],
+            8192,
         ),  # DFlash with 3 layers + verifier last layer
         (
             TEXT_MODEL,
-            "sharegpt",
+            "hf:inference-optimization/speculators-ci-datasets:smoke_regen",
+            "dflash2",
+            ["--block-size", "8", "--max-anchors", "256", "--num-layers", "3"],
+            [1, 13, 25],
+            151936,
+        ),  # DFlash2 with convolution + candidate selector
+        (
+            TEXT_MODEL,
+            "hf:inference-optimization/speculators-ci-datasets:smoke_regen",
             "peagle",
             [
                 "--num-layers",
@@ -57,7 +80,33 @@ MM_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
                 "--no-norm-before-residual",
             ],
             None,
+            8192,
         ),  # P-EAGLE with parallel multi-token prediction
+        (
+            TEXT_MODEL,
+            "hf:inference-optimization/speculators-ci-datasets:smoke_regen",
+            "dspark",
+            [
+                "--block-size",
+                "8",
+                "--max-anchors",
+                "256",
+                "--num-layers",
+                "3",
+                "--markov-rank",
+                "256",
+                "--markov-head-type",
+                "vanilla",
+                "--enable-confidence-head",
+                "--confidence-head-with-markov",
+                "--confidence-head-alpha",
+                "1.0",
+                "--loss-fn",
+                '{"ce": 0.1, "tv": 0.9}',
+            ],
+            [1, 13, 25],
+            8192,
+        ),  # DSpark with Markov + confidence heads
     ],
 )
 def test_offline_smoke(
@@ -69,6 +118,7 @@ def test_offline_smoke(
     speculator_type: str,
     extra_train_args: list[str],
     target_layer_ids: list[int] | None,
+    draft_vocab_size: int,
 ):
     if dataset == "sharegpt4v_coco":
         coco_dir = tmp_path / "coco"
@@ -93,6 +143,7 @@ def test_offline_smoke(
         speculator_type=speculator_type,
         extra_train_args=extra_train_args,
         target_layer_ids=target_layer_ids,
+        draft_vocab_size=draft_vocab_size,
     )
 
 
@@ -123,9 +174,6 @@ def run_offline_e2e(
     offline_hidden_states = tmp_path / "offline_hidden_states"
     save_path = tmp_path / "checkpoints"
 
-    # Step 1: Prepare data
-    run_prepare_data(model, dataset, data_path, max_samples, seq_length)
-
     with launch_vllm_server_context(
         model,
         port,
@@ -134,7 +182,19 @@ def run_offline_e2e(
         target_layer_ids=target_layer_ids,
         **(vllm_kwargs or {}),
     ):
-        # Step 2: Generate hidden states offline
+        # Prepare data: pretokenized HF datasets pass through without
+        # rendering; conversation datasets use the render endpoint.
+        run_prepare_data(
+            model,
+            dataset,
+            data_path,
+            max_samples,
+            seq_length,
+            render_endpoint=f"http://localhost:{port}",
+            skip_token_freq=draft_vocab_size is None,
+        )
+
+        # Generate hidden states offline
         run_data_generation_offline(
             data_path,
             offline_hidden_states,
@@ -165,6 +225,7 @@ def run_offline_e2e(
     # Step 4: Validate trained checkpoint with vLLM inference
     if prompts is not None:
         checkpoint_path = str(save_path / "checkpoint_best")
+        inference_kwargs = {**(vllm_kwargs or {}), "gpu_memory_utilization": 0.8}
         run_vllm_engine(
             model_path=checkpoint_path,
             tmp_path=tmp_path,
@@ -173,5 +234,5 @@ def run_offline_e2e(
             max_tokens=max_tokens,
             ignore_eos=ignore_eos,
             acceptance_thresholds=acceptance_thresholds,
-            **(vllm_kwargs or {}),
+            **inference_kwargs,
         )

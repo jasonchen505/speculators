@@ -1,61 +1,16 @@
+import datetime
+import importlib.metadata
 import logging
 import os
+import shlex
+import sys
 import warnings
-
-import torch
-import torch.distributed as dist
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from pathlib import Path
 
 from speculators.data_generation.preprocessing import get_tokenizer, load_processor
-
-local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-world_size = int(os.environ.get("WORLD_SIZE", "1"))
-is_distributed = "LOCAL_RANK" in os.environ
+from speculators.provenance import atomic_write, find_repo_root, git_diff, git_sha
 
 logger = logging.getLogger("speculators")
-
-
-def maybe_setup_distributed() -> tuple[int, int, int, bool]:
-    """Sets up distributed training if the process was launched with `torchrun`.
-    If not, returns single process training.
-
-    Based on of https://docs.pytorch.org/tutorials/intermediate/ddp_tutorial.html#initialize-ddp-with-torch-distributed-run-torchrun
-
-    Returns:
-        tuple[int, int, int, bool]: Local rank, world size, rank, and is_distributed.
-    """
-    if not is_distributed:
-        # No distributed training
-        return 0, 1, 0, False
-
-    torch.accelerator.set_device_index(local_rank)
-    acc = torch.accelerator.current_accelerator()
-    if acc is None:
-        raise ValueError("No accelerator found")
-    backend = torch.distributed.get_default_backend_for_device(acc)
-    dist.init_process_group(backend, device_id=local_rank)
-
-    rank = dist.get_rank()
-
-    logger.info(
-        f"Started distributed with local_rank={local_rank},"
-        f" world_size={world_size}, rank={rank}",
-        extra={"override_rank0_filter": True},
-    )
-    return local_rank, world_size, rank, True
-
-
-def maybe_destroy_distributed():
-    """Destroys the distributed process group if using distributed training."""
-    if not is_distributed:
-        # No distributed training
-        return
-
-    dist.destroy_process_group()
-    logger.info(
-        f"Destroyed distributed with local_rank={local_rank}, world_size={world_size}",
-        extra={"override_rank0_filter": True},
-    )
 
 
 def resolve_mask_token_id(
@@ -144,21 +99,48 @@ def normalize_counted_metrics(
     return metrics
 
 
-def apply_fully_sharded(model: torch.nn.Module):
-    """Applies torch FSDP fully_shard to the model, wrapping layers in FSDPModule.
+def _save_speculators_patch(save_dir: Path, repo_root: Path | None, sha: str) -> None:
+    if repo_root is None:
+        return
+    try:
+        diff = git_diff(repo_root)
+        content = f"# repo: {repo_root} ({sha})\n{diff}"
+        atomic_write(save_dir / "speculators.patch", content)
+    except OSError:
+        logger.warning("Failed to save speculators.patch", exc_info=True)
 
-    Assumes the model has a `layers` attribute containing the decoder layers.
-    Model should be validated with SpeculatorModel.verify_training_compatible()
-    before calling this function.
+
+def save_train_command(save_path: str, argv: list[str] | None = None) -> None:
+    """Write train_command.txt and speculators.patch to *save_path*.
+
+    ``argv`` is the exact command the run was resolved from (``TrainConfig`` records
+    it during resolution); it falls back to the live ``sys.argv`` when a caller has
+    no recorded argv, so a direct call is unchanged.
     """
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
+    repo_root = find_repo_root(Path(__file__))
+    sha = git_sha(repo_root)
+
+    pkg_versions: list[str] = []
+    for pkg in ("speculators", "vllm", "transformers", "torch", "compressed-tensors"):
+        try:
+            ver = importlib.metadata.version(pkg)
+        except importlib.metadata.PackageNotFoundError:
+            ver = "not installed"
+        pkg_versions.append(f"# {pkg}: {ver}")
+
+    header = "\n".join(
+        [
+            f"# Timestamp: {datetime.datetime.now(datetime.timezone.utc).isoformat()}",
+            f"# Git SHA: {sha}",
+            f"# World size: {os.environ.get('WORLD_SIZE', '1')}",
+            *pkg_versions,
+        ]
     )
 
-    for layer in model.layers:  # type: ignore[union-attr]
-        fully_shard(layer, mp_policy=mp_policy)
+    command = shlex.join(argv or sys.argv)
+    content = f"{header}\n{command}\n"
 
-    fully_shard(model)
-
-    return model
+    path = Path(save_path)
+    path.mkdir(parents=True, exist_ok=True)
+    atomic_write(path / "train_command.txt", content)
+    _save_speculators_patch(path, repo_root, sha)

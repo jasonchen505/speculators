@@ -6,7 +6,6 @@ import csv
 import json
 import logging
 import math
-import os
 import re
 import shutil
 import statistics
@@ -28,6 +27,7 @@ except ImportError:
     UnivariateSpline = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("evaluate")
+
 
 # ---------------------------------------------------------------------------
 # Metric definitions (for plotting)
@@ -151,7 +151,7 @@ def _load_json(
     with filepath.open() as f:
         data = json.load(f)
 
-    subset = Path(data["args"]["data_args"][0]["data_files"]).stem
+    subset = Path(data["config"]["spec"]["data"][0]["load_kwargs"]["data_files"]).stem
     points: list[tuple[float, float]] = []
     for bench in data.get("benchmarks", []):
         if bench.get("config", {}).get("strategy", {}).get("type_") != "constant":
@@ -186,7 +186,7 @@ def parse_source_args(source_args: list[str]) -> dict[str, list[Path]]:
     for arg in source_args:
         if "=" not in arg:
             raise ValueError(f"Invalid source format: '{arg}'. Expected 'LABEL=PATH'.")
-        label, path_str = arg.split("=", 1)
+        label, path_str = arg.rsplit("=", 1)
         path = Path(path_str.strip())
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
@@ -247,7 +247,7 @@ def parse_gen_len_file(filepath: Path) -> dict:
     if not successful:
         raise ValueError(f"No successful requests found in {filepath}")
 
-    output_tokens = [r["output_tokens"] for r in successful]
+    output_tokens = [r["output_metrics"]["text_tokens"] for r in successful]
     median = statistics.median(output_tokens)
 
     return {
@@ -301,7 +301,7 @@ def parse_prometheus_metrics(raw_text: str) -> list[Metric]:
         pos_values.sort()
         values = [0.0] * (pos_values[-1][0] + 1)
         for pos, val in pos_values:
-            values[pos] = val
+            values[pos] += val
         metrics.append(Vector(name=name, values=values))
 
     return metrics
@@ -517,17 +517,14 @@ def check_dependencies() -> None:
         sys.exit(1)
 
 
-def build_backend_args(gen_kwargs: str, max_tokens: int) -> str:
-    if gen_kwargs:
-        try:
-            body = json.loads(gen_kwargs)
-        except json.JSONDecodeError as e:
-            msg = f"Invalid JSON in --gen-kwargs: {gen_kwargs!r}: {e}"
-            raise ValueError(msg) from e
-    else:
-        body = {}
-    body["max_tokens"] = max_tokens
-    return json.dumps({"extras": {"body": body}})
+def parse_gen_kwargs(gen_kwargs: str) -> dict:
+    if not gen_kwargs:
+        return {}
+    try:
+        return json.loads(gen_kwargs)
+    except json.JSONDecodeError as e:
+        msg = f"Invalid JSON in --gen-kwargs: {gen_kwargs!r}: {e}"
+        raise ValueError(msg) from e
 
 
 def fetch_metrics(metrics_url: str, retries: int = 3, delay: float = 2.0) -> str | None:
@@ -551,38 +548,46 @@ def fetch_metrics(metrics_url: str, retries: int = 3, delay: float = 2.0) -> str
 def run_guidellm(
     target: str,
     dataset: str,
-    subset: str,
+    subset: str | None,
     data_column_mapper: str,
     profile: str,
     rate: int | str,
     max_requests: int | None,
     max_concurrency: int,
     output_path: Path,
-    backend_args: str,
+    max_tokens: int,
+    gen_kwargs: dict | None = None,
+    request_format: str | None = None,
 ) -> None:
-    cmd = [
-        "guidellm",
-        "benchmark",
-        "--target",
-        target,
-        "--data",
-        dataset,
-        "--data-args",
-        json.dumps({"data_files": f"{subset}.jsonl"}),
-        "--data-column-mapper",
-        data_column_mapper,
-        "--profile",
-        profile,
-        "--rate",
-        str(rate),
-        "--output-path",
-        str(output_path),
-        "--backend-args",
-        backend_args,
-    ]
-    if max_requests is not None:
-        cmd.extend(["--max-requests", str(max_requests)])
+    # Building the backend as a JSON object to support nested gen_kwargs for guidellm.
+    backend: dict[str, object] = {
+        "kind": "openai_http",
+        "target": target,
+        "max_tokens": max_tokens,
+    }
+    if request_format:
+        backend["request_format"] = request_format
+    if gen_kwargs:
+        backend["extras"] = {"body": gen_kwargs}
+    cmd = ["guidellm", "run", "--backend", json.dumps(backend)]
 
-    env = os.environ.copy()
-    env["GUIDELLM__MAX_CONCURRENCY"] = str(max_concurrency)
-    subprocess.run(cmd, check=True, env=env)  # noqa: S603
+    if subset is not None:
+        data = f"kind=huggingface,source={dataset}"
+        data += f",load_kwargs.data_files={subset}.jsonl,load_kwargs.split=train"
+    else:
+        data = f"kind=json_file,path={dataset},load_kwargs.split=train"
+    cmd.extend(["--data", data])
+
+    cmd.extend(["--data-column-mapper", data_column_mapper])
+
+    profile_str = f"kind={profile},max_concurrency={max_concurrency}"
+    if profile == "sweep":
+        profile_str += f",sweep_size={rate}"
+    cmd.extend(["--profile", profile_str])
+
+    if max_requests is not None:
+        cmd.extend(["--constraint", f"kind=max_requests,count={max_requests}"])
+
+    cmd.extend(["--output", f"kind=json,path={output_path}"])
+
+    subprocess.run(cmd, check=True)  # noqa: S603

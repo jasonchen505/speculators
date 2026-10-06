@@ -21,9 +21,16 @@ from torch.nn import Module
 logger = logging.getLogger("speculators")
 
 # Names of parameters that are 2D but should still be optimized with AdamW rather than
-# Muon, following the convention from Keller Jordan's Muon (embeddings and the output
-# head are excluded from the orthogonalized update).
-_ADAMW_NAME_HINTS = ("embed_tokens", "lm_head")
+# Muon, following the convention from Keller Jordan's Muon (embeddings, embedding-like
+# codebooks, Markov vocabulary factors, and output heads are excluded from the
+# orthogonalized update).
+_ADAMW_NAME_HINTS = (
+    "embed_tokens",
+    "lm_head",
+    "codebook",
+    "markov_w1",
+    "markov_w2",
+)
 
 # Muon only orthogonalizes 2D weight matrices.
 _MATRIX_NDIM = 2
@@ -34,8 +41,11 @@ def split_named_params_for_muon(
 ) -> tuple[list[tuple[str, Tensor]], list[tuple[str, Tensor]]]:
     """Split a model's trainable parameters into Muon and AdamW groups.
 
-    A parameter goes to the Muon group iff it requires gradients, is 2D, and is not an
-    embedding or LM-head weight. All other trainable parameters go to the AdamW group.
+    A parameter goes to Muon iff it requires gradients, is a 2D matrix with both
+    dimensions > 1, and is not an embedding, codebook, or vocabulary-output weight;
+    everything else goes to AdamW. Degenerate 2D weights (``[1, N]`` / ``[N, 1]``
+    vectors) route to AdamW -- Muon orthogonalizes matrices, not vectors, and crashes
+    on them under FSDP2.
 
     :param model: The model whose parameters should be partitioned.
     :return: A ``(muon_params, adamw_params)`` tuple of named parameter lists.
@@ -45,8 +55,10 @@ def split_named_params_for_muon(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim == _MATRIX_NDIM and not any(
-            hint in name for hint in _ADAMW_NAME_HINTS
+        if (
+            param.ndim == _MATRIX_NDIM
+            and min(param.shape) > 1  # exclude degenerate [1, N] / [N, 1] vectors
+            and not any(hint in name for hint in _ADAMW_NAME_HINTS)
         ):
             muon_params.append((name, param))
         else:
